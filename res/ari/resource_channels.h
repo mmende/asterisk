@@ -299,6 +299,8 @@ struct ast_ari_channels_redirect_args {
 	const char *channel_id;
 	/*! The endpoint to redirect the channel to */
 	const char *endpoint;
+	/*! Optional list of SIP headers to add to an outbound REFER */
+	struct ast_json *refer_headers;
 };
 /*!
  * \brief Body parsing function for /channels/{channelId}/redirect.

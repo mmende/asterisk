@@ -2729,6 +2729,119 @@ int ast_transfer(struct ast_channel *chan, char *dest);
  */
 int ast_transfer_protocol(struct ast_channel *chan, char *dest, int *protocol);
 
+/*! \brief Opaque list of transfer headers */
+struct ast_transfer_header_list;
+
+/*!
+ * \brief Allocate a transfer header list.
+ *
+ * \retval non-NULL on success
+ * \retval NULL on failure
+ */
+struct ast_transfer_header_list *ast_transfer_header_list_alloc(void);
+
+/*!
+ * \brief Destroy a transfer header list.
+ */
+void ast_transfer_header_list_destroy(struct ast_transfer_header_list *list);
+
+/*!
+ * \brief Add a transfer header to a list (appends, duplicates allowed).
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int ast_transfer_header_list_add(struct ast_transfer_header_list *list, const char *name, const char *value);
+
+/*!
+ * \brief Update the first transfer header matching name or append if none exists.
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int ast_transfer_header_list_update(struct ast_transfer_header_list *list, const char *name, const char *value);
+
+/*!
+ * \brief Remove all transfer headers matching name (case-insensitive).
+ *
+ * \retval number of headers removed
+ */
+int ast_transfer_header_list_remove(struct ast_transfer_header_list *list, const char *name);
+
+/*!
+ * \brief Clear all transfer headers from a list.
+ */
+void ast_transfer_header_list_clear(struct ast_transfer_header_list *list);
+
+/*!
+ * \brief Callback invoked for each header in a list.
+ *
+ * \retval 0 to continue iterating
+ * \retval non-zero to stop iterating
+ */
+typedef int (*ast_transfer_header_iter_cb)(void *data, const char *name, const char *value);
+
+/*!
+ * \brief Iterate over headers in a list in insertion order.
+ *
+ * \retval number of headers iterated
+ */
+int ast_transfer_header_list_iterate(struct ast_transfer_header_list *list,
+	ast_transfer_header_iter_cb cb, void *data);
+
+/*!
+ * \brief Retrieve the persistent transfer header list on a channel.
+ *
+ * \note Returns a referenced list. Caller must ao2_cleanup().
+ */
+struct ast_transfer_header_list *ast_channel_transfer_header_list_get(struct ast_channel *chan);
+
+/*!
+ * \brief Add a transfer header to the persistent channel list.
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int ast_channel_transfer_header_add(struct ast_channel *chan, const char *name, const char *value);
+
+/*!
+ * \brief Update the first matching transfer header or append if none exists.
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int ast_channel_transfer_header_update(struct ast_channel *chan, const char *name, const char *value);
+
+/*!
+ * \brief Remove all matching transfer headers from the persistent channel list.
+ *
+ * \retval number of headers removed
+ */
+int ast_channel_transfer_header_remove(struct ast_channel *chan, const char *name);
+
+/*!
+ * \brief Clear all persistent transfer headers from a channel.
+ */
+void ast_channel_transfer_header_clear(struct ast_channel *chan);
+
+/*!
+ * \brief Set a temporary transfer header list for the next transfer.
+ *
+ * \note The list is referenced. Caller must ao2_cleanup() its copy.
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int ast_channel_transfer_header_list_set_temporary(struct ast_channel *chan,
+	struct ast_transfer_header_list *list);
+
+/*!
+ * \brief Retrieve and clear the temporary transfer header list for a channel.
+ *
+ * \note Returns a referenced list. Caller must ao2_cleanup().
+ */
+struct ast_transfer_header_list *ast_channel_transfer_header_list_take_temporary(struct ast_channel *chan);
+
 /*!
  * \brief Inherits channel variable from parent to child channel
  * \param parent Parent channel

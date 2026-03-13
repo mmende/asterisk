@@ -2086,6 +2086,35 @@ static void xfer_client_on_evsub_state(pjsip_evsub *sub, pjsip_event *event)
 	}
 }
 
+static int add_transfer_header_cb(void *data, const char *name, const char *value)
+{
+	pjsip_tx_data *packet = data;
+
+	ast_sip_add_header(packet, name, value);
+	return 0;
+}
+
+static void add_transfer_headers_to_refer(struct ast_channel *chan, pjsip_tx_data *packet)
+{
+	RAII_VAR(struct ast_transfer_header_list *, persistent,
+		ast_channel_transfer_header_list_get(chan), ao2_cleanup);
+	RAII_VAR(struct ast_transfer_header_list *, temporary,
+		ast_channel_transfer_header_list_take_temporary(chan), ao2_cleanup);
+	int count = 0;
+
+	if (persistent) {
+		count += ast_transfer_header_list_iterate(persistent, add_transfer_header_cb, packet);
+	}
+	if (temporary) {
+		count += ast_transfer_header_list_iterate(temporary, add_transfer_header_cb, packet);
+	}
+
+	if (count) {
+		ast_debug(3, "Added %d transfer header(s) to outbound REFER on channel %s\n",
+			count, ast_channel_name(chan));
+	}
+}
+
 static void transfer_refer(struct ast_sip_session *session, const char *target)
 {
 	pjsip_evsub *sub;
@@ -2125,6 +2154,8 @@ static void transfer_refer(struct ast_sip_session *session, const char *target)
 		ast_sip_add_header(packet, "Referred-By", local_info);
 	}
 
+	add_transfer_headers_to_refer(chan, packet);
+
 	if (pjsip_xfer_send_request(sub, packet) == PJ_SUCCESS) {
 		return;
 	}
@@ -2160,6 +2191,12 @@ static int transfer(void *data)
 		}
 
 		if (ast_channel_state(trnf_data->session->channel) == AST_STATE_RING) {
+			RAII_VAR(struct ast_transfer_header_list *, temporary,
+				ast_channel_transfer_header_list_take_temporary(trnf_data->session->channel), ao2_cleanup);
+			if (temporary) {
+				ast_debug(3, "Transfer headers supplied but redirect used 302 on channel %s; ignoring\n",
+					ast_channel_name(trnf_data->session->channel));
+			}
 			transfer_redirect(trnf_data->session, target);
 		} else {
 			transfer_refer(trnf_data->session, target);
@@ -3321,6 +3358,11 @@ static struct ast_custom_function transfer_handling_function = {
 	.write = pjsip_transfer_handling_write,
 };
 
+static struct ast_custom_function transfer_header_function = {
+	.name = "PJSIP_TRANSFER_HEADER",
+	.write = pjsip_transfer_header_write,
+};
+
 static char *app_pjsip_hangup = "PJSIPHangup";
 
 /*!
@@ -3390,6 +3432,11 @@ static int load_module(void)
 		goto end;
 	}
 
+	if (ast_custom_function_register(&transfer_header_function)) {
+		ast_log(LOG_WARNING, "Unable to register PJSIP_TRANSFER_HEADER dialplan function\n");
+		goto end;
+	}
+
 	if (ast_register_application_xml(app_pjsip_hangup, pjsip_app_hangup)) {
 		ast_log(LOG_WARNING, "Unable to register PJSIPHangup dialplan application\n");
 		goto end;
@@ -3446,6 +3493,7 @@ end:
 	ast_custom_function_unregister(&chan_pjsip_parse_uri_from_function);
 	ast_custom_function_unregister(&session_refresh_function);
 	ast_custom_function_unregister(&transfer_handling_function);
+	ast_custom_function_unregister(&transfer_header_function);
 	ast_unregister_application(app_pjsip_hangup);
 	ast_manager_unregister(app_pjsip_hangup);
 
@@ -3480,6 +3528,7 @@ static int unload_module(void)
 	ast_custom_function_unregister(&chan_pjsip_parse_uri_from_function);
 	ast_custom_function_unregister(&session_refresh_function);
 	ast_custom_function_unregister(&transfer_handling_function);
+	ast_custom_function_unregister(&transfer_header_function);
 	ast_unregister_application(app_pjsip_hangup);
 	ast_manager_unregister(app_pjsip_hangup);
 

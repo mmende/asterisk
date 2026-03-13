@@ -6550,6 +6550,371 @@ int ast_transfer_protocol(struct ast_channel *chan, char *dest, int *protocol)
 	return res;
 }
 
+struct ast_transfer_header_entry {
+	char *name;
+	char *value;
+	AST_LIST_ENTRY(ast_transfer_header_entry) entry;
+};
+
+struct ast_transfer_header_list {
+	AST_LIST_HEAD_NOLOCK(, ast_transfer_header_entry) headers;
+};
+
+static void transfer_header_entry_destroy(struct ast_transfer_header_entry *entry)
+{
+	ast_free(entry->name);
+	ast_free(entry->value);
+	ast_free(entry);
+}
+
+static void transfer_header_list_destroy(void *obj)
+{
+	struct ast_transfer_header_list *list = obj;
+	struct ast_transfer_header_entry *entry;
+
+	while ((entry = AST_LIST_REMOVE_HEAD(&list->headers, entry))) {
+		transfer_header_entry_destroy(entry);
+	}
+}
+
+static void transfer_header_datastore_destroy(void *data)
+{
+	ao2_cleanup(data);
+}
+
+static const struct ast_datastore_info transfer_header_datastore_info = {
+	.type = "pjsip_transfer_headers",
+	.destroy = transfer_header_datastore_destroy,
+};
+
+static const struct ast_datastore_info transfer_header_temp_datastore_info = {
+	.type = "pjsip_transfer_headers_tmp",
+	.destroy = transfer_header_datastore_destroy,
+};
+
+struct ast_transfer_header_list *ast_transfer_header_list_alloc(void)
+{
+	struct ast_transfer_header_list *list;
+
+	list = ao2_alloc(sizeof(*list), transfer_header_list_destroy);
+	if (!list) {
+		return NULL;
+	}
+
+	AST_LIST_HEAD_INIT_NOLOCK(&list->headers);
+	return list;
+}
+
+void ast_transfer_header_list_destroy(struct ast_transfer_header_list *list)
+{
+	ao2_cleanup(list);
+}
+
+static struct ast_transfer_header_entry *transfer_header_entry_alloc(const char *name, const char *value)
+{
+	struct ast_transfer_header_entry *entry;
+
+	entry = ast_calloc(1, sizeof(*entry));
+	if (!entry) {
+		return NULL;
+	}
+
+	entry->name = ast_strdup(name);
+	entry->value = ast_strdup(S_OR(value, ""));
+	if (!entry->name || !entry->value) {
+		transfer_header_entry_destroy(entry);
+		return NULL;
+	}
+
+	return entry;
+}
+
+int ast_transfer_header_list_add(struct ast_transfer_header_list *list, const char *name, const char *value)
+{
+	struct ast_transfer_header_entry *entry;
+
+	if (!list || ast_strlen_zero(name)) {
+		return -1;
+	}
+
+	entry = transfer_header_entry_alloc(name, value);
+	if (!entry) {
+		return -1;
+	}
+
+	AST_LIST_INSERT_TAIL(&list->headers, entry, entry);
+	return 0;
+}
+
+int ast_transfer_header_list_update(struct ast_transfer_header_list *list, const char *name, const char *value)
+{
+	struct ast_transfer_header_entry *entry;
+	char *new_value;
+
+	if (!list || ast_strlen_zero(name)) {
+		return -1;
+	}
+
+	AST_LIST_TRAVERSE(&list->headers, entry, entry) {
+		if (!strcasecmp(entry->name, name)) {
+			new_value = ast_strdup(S_OR(value, ""));
+			if (!new_value) {
+				return -1;
+			}
+			ast_free(entry->value);
+			entry->value = new_value;
+			return 0;
+		}
+	}
+
+	return ast_transfer_header_list_add(list, name, value);
+}
+
+int ast_transfer_header_list_remove(struct ast_transfer_header_list *list, const char *name)
+{
+	struct ast_transfer_header_entry *entry;
+	int removed = 0;
+
+	if (!list || ast_strlen_zero(name)) {
+		return 0;
+	}
+
+	AST_LIST_TRAVERSE_SAFE_BEGIN(&list->headers, entry, entry) {
+		if (!strcasecmp(entry->name, name)) {
+			AST_LIST_REMOVE_CURRENT(entry);
+			transfer_header_entry_destroy(entry);
+			removed++;
+		}
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+
+	return removed;
+}
+
+void ast_transfer_header_list_clear(struct ast_transfer_header_list *list)
+{
+	struct ast_transfer_header_entry *entry;
+
+	if (!list) {
+		return;
+	}
+
+	while ((entry = AST_LIST_REMOVE_HEAD(&list->headers, entry))) {
+		transfer_header_entry_destroy(entry);
+	}
+}
+
+int ast_transfer_header_list_iterate(struct ast_transfer_header_list *list,
+	ast_transfer_header_iter_cb cb, void *data)
+{
+	struct ast_transfer_header_entry *entry;
+	int count = 0;
+
+	if (!list || !cb) {
+		return 0;
+	}
+
+	AST_LIST_TRAVERSE(&list->headers, entry, entry) {
+		count++;
+		if (cb(data, entry->name, entry->value)) {
+			break;
+		}
+	}
+
+	return count;
+}
+
+struct ast_transfer_header_list *ast_channel_transfer_header_list_get(struct ast_channel *chan)
+{
+	struct ast_datastore *datastore;
+	struct ast_transfer_header_list *list = NULL;
+
+	if (!chan) {
+		return NULL;
+	}
+
+	ast_channel_lock(chan);
+	datastore = ast_channel_datastore_find(chan, &transfer_header_datastore_info, NULL);
+	if (datastore && datastore->data) {
+		list = datastore->data;
+		ao2_ref(list, +1);
+	}
+	ast_channel_unlock(chan);
+
+	return list;
+}
+
+static struct ast_transfer_header_list *transfer_header_list_get_or_create_locked(struct ast_channel *chan)
+{
+	struct ast_datastore *datastore;
+	struct ast_transfer_header_list *list;
+
+	datastore = ast_channel_datastore_find(chan, &transfer_header_datastore_info, NULL);
+	if (datastore) {
+		return datastore->data;
+	}
+
+	datastore = ast_datastore_alloc(&transfer_header_datastore_info, NULL);
+	if (!datastore) {
+		return NULL;
+	}
+
+	list = ast_transfer_header_list_alloc();
+	if (!list) {
+		ast_datastore_free(datastore);
+		return NULL;
+	}
+
+	datastore->data = list;
+	ast_channel_datastore_add(chan, datastore);
+	return list;
+}
+
+int ast_channel_transfer_header_add(struct ast_channel *chan, const char *name, const char *value)
+{
+	struct ast_transfer_header_list *list;
+	int res = -1;
+
+	if (!chan) {
+		return -1;
+	}
+
+	ast_channel_lock(chan);
+	list = transfer_header_list_get_or_create_locked(chan);
+	if (list) {
+		res = ast_transfer_header_list_add(list, name, value);
+	}
+	ast_channel_unlock(chan);
+
+	return res;
+}
+
+int ast_channel_transfer_header_update(struct ast_channel *chan, const char *name, const char *value)
+{
+	struct ast_transfer_header_list *list;
+	int res = -1;
+
+	if (!chan) {
+		return -1;
+	}
+
+	ast_channel_lock(chan);
+	list = transfer_header_list_get_or_create_locked(chan);
+	if (list) {
+		res = ast_transfer_header_list_update(list, name, value);
+	}
+	ast_channel_unlock(chan);
+
+	return res;
+}
+
+int ast_channel_transfer_header_remove(struct ast_channel *chan, const char *name)
+{
+	struct ast_transfer_header_list *list;
+	int removed = 0;
+
+	if (!chan) {
+		return 0;
+	}
+
+	ast_channel_lock(chan);
+	list = NULL;
+	{
+		struct ast_datastore *datastore;
+		datastore = ast_channel_datastore_find(chan, &transfer_header_datastore_info, NULL);
+		if (datastore) {
+			list = datastore->data;
+		}
+	}
+	if (list) {
+		removed = ast_transfer_header_list_remove(list, name);
+	}
+	ast_channel_unlock(chan);
+
+	return removed;
+}
+
+void ast_channel_transfer_header_clear(struct ast_channel *chan)
+{
+	struct ast_datastore *datastore;
+
+	if (!chan) {
+		return;
+	}
+
+	ast_channel_lock(chan);
+	datastore = ast_channel_datastore_find(chan, &transfer_header_datastore_info, NULL);
+	if (datastore) {
+		ast_channel_datastore_remove(chan, datastore);
+		ast_datastore_free(datastore);
+	}
+	ast_channel_unlock(chan);
+}
+
+int ast_channel_transfer_header_list_set_temporary(struct ast_channel *chan,
+	struct ast_transfer_header_list *list)
+{
+	struct ast_datastore *datastore;
+
+	if (!chan) {
+		return -1;
+	}
+
+	ast_channel_lock(chan);
+	datastore = ast_channel_datastore_find(chan, &transfer_header_temp_datastore_info, NULL);
+
+	if (!list) {
+		if (datastore) {
+			ast_channel_datastore_remove(chan, datastore);
+			ast_datastore_free(datastore);
+		}
+		ast_channel_unlock(chan);
+		return 0;
+	}
+
+	if (!datastore) {
+		datastore = ast_datastore_alloc(&transfer_header_temp_datastore_info, NULL);
+		if (!datastore) {
+			ast_channel_unlock(chan);
+			return -1;
+		}
+		ast_channel_datastore_add(chan, datastore);
+	} else if (datastore->data) {
+		ao2_cleanup(datastore->data);
+	}
+
+	ao2_ref(list, +1);
+	datastore->data = list;
+	ast_channel_unlock(chan);
+
+	return 0;
+}
+
+struct ast_transfer_header_list *ast_channel_transfer_header_list_take_temporary(struct ast_channel *chan)
+{
+	struct ast_datastore *datastore;
+	struct ast_transfer_header_list *list = NULL;
+
+	if (!chan) {
+		return NULL;
+	}
+
+	ast_channel_lock(chan);
+	datastore = ast_channel_datastore_find(chan, &transfer_header_temp_datastore_info, NULL);
+	if (datastore && datastore->data) {
+		list = datastore->data;
+		ao2_ref(list, +1);
+	}
+
+	if (datastore) {
+		ast_channel_datastore_remove(chan, datastore);
+		ast_datastore_free(datastore);
+	}
+	ast_channel_unlock(chan);
+
+	return list;
+}
+
 int ast_readstring(struct ast_channel *c, char *s, int len, int timeout, int ftimeout, char *enders)
 {
 	return ast_readstring_full(c, s, len, timeout, ftimeout, enders, -1, -1);
@@ -11085,4 +11450,3 @@ void ast_channel_clear_flag(struct ast_channel *chan, unsigned int flag)
 	ast_clear_flag(ast_channel_flags(chan), flag);
 	ast_channel_unlock(chan);
 }
-

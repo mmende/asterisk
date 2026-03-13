@@ -31,6 +31,7 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
 #include <pjsip.h>
 #include <pjlib.h>
 #include <pjsip_ua.h>
@@ -1400,4 +1401,144 @@ int pjsip_transfer_handling_write(struct ast_channel *chan, const char *cmd, cha
 
 	ast_channel_unlock(chan);
 	return ret;
+}
+
+static int transfer_header_is_token(const char *str)
+{
+	if (ast_strlen_zero(str)) {
+		return 0;
+	}
+
+	do {
+		if (!isalnum((unsigned char) *str)
+			&& !strchr("-.!%*_+`'~", *str)) {
+			return 0;
+		}
+	} while (*++str);
+
+	return 1;
+}
+
+static int transfer_header_name_blocked(const char *name)
+{
+	static const char *denylist[] = {
+		"Via",
+		"Route",
+		"Record-Route",
+		"Contact",
+		"From",
+		"To",
+		"Call-ID",
+		"CSeq",
+		"Max-Forwards",
+		"Content-Length",
+		"Content-Type",
+		"Authorization",
+		"Proxy-Authorization",
+		"Refer-To",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_LEN(denylist); ++i) {
+		if (!strcasecmp(name, denylist[i])) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int transfer_header_name_valid(const char *name)
+{
+	const char *p;
+
+	if (ast_strlen_zero(name)) {
+		return 0;
+	}
+
+	for (p = name; *p; ++p) {
+		if (*p == ':' || *p == '\r' || *p == '\n' || isspace((unsigned char) *p)) {
+			return 0;
+		}
+	}
+
+	return transfer_header_is_token(name);
+}
+
+static int transfer_header_value_valid(const char *value)
+{
+	if (!value) {
+		return 0;
+	}
+
+	return !strpbrk(value, "\r\n");
+}
+
+int pjsip_transfer_header_write(struct ast_channel *chan, const char *cmd, char *data, const char *value)
+{
+	AST_DECLARE_APP_ARGS(args,
+		AST_APP_ARG(action);
+		AST_APP_ARG(header_name);
+	);
+	AST_STANDARD_APP_ARGS(args, data);
+
+	if (!chan) {
+		ast_log(LOG_WARNING, "No channel was provided to %s function.\n", cmd);
+		return -1;
+	}
+
+	ast_channel_lock(chan);
+	if (strcmp(ast_channel_tech(chan)->type, "PJSIP")) {
+		ast_log(LOG_WARNING, "Cannot call %s on a non-PJSIP channel %s\n", cmd, ast_channel_name(chan));
+		ast_channel_unlock(chan);
+		return -1;
+	}
+	ast_channel_unlock(chan);
+
+	if (ast_strlen_zero(args.action)) {
+		ast_log(LOG_WARNING, "%s: Missing action\n", cmd);
+		return -1;
+	}
+
+	if (!strcasecmp(args.action, "clear")) {
+		ast_channel_transfer_header_clear(chan);
+		return 0;
+	}
+
+	if (ast_strlen_zero(args.header_name)) {
+		ast_log(LOG_WARNING, "%s: Missing header name for action '%s'\n", cmd, args.action);
+		return -1;
+	}
+
+	if (!transfer_header_name_valid(args.header_name)) {
+		ast_log(LOG_WARNING, "%s: Rejecting invalid transfer header name '%s'\n",
+			ast_channel_name(chan), args.header_name);
+		return -1;
+	}
+
+	if (transfer_header_name_blocked(args.header_name)) {
+		ast_log(LOG_WARNING, "%s: Rejecting forbidden transfer header '%s'\n",
+			ast_channel_name(chan), args.header_name);
+		return -1;
+	}
+
+	if (!strcasecmp(args.action, "add") || !strcasecmp(args.action, "update")) {
+		if (!transfer_header_value_valid(S_OR(value, ""))) {
+			ast_log(LOG_WARNING, "%s: Rejecting transfer header '%s' with invalid value\n",
+				ast_channel_name(chan), args.header_name);
+			return -1;
+		}
+	}
+
+	if (!strcasecmp(args.action, "add")) {
+		return ast_channel_transfer_header_add(chan, args.header_name, S_OR(value, ""));
+	} else if (!strcasecmp(args.action, "update")) {
+		return ast_channel_transfer_header_update(chan, args.header_name, S_OR(value, ""));
+	} else if (!strcasecmp(args.action, "remove")) {
+		ast_channel_transfer_header_remove(chan, args.header_name);
+		return 0;
+	}
+
+	ast_log(LOG_WARNING, "%s: Invalid action '%s'\n", cmd, args.action);
+	return -1;
 }

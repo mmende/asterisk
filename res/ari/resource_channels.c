@@ -29,10 +29,13 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
+
 #include "asterisk/file.h"
 #include "asterisk/pbx.h"
 #include "asterisk/bridge.h"
 #include "asterisk/callerid.h"
+#include "asterisk/channel.h"
 #include "asterisk/stasis_app.h"
 #include "asterisk/stasis_app_playback.h"
 #include "asterisk/stasis_app_recording.h"
@@ -49,6 +52,9 @@
 
 #include <limits.h>
 
+struct ast_ari_response;
+static int json_to_transfer_headers(struct ast_ari_response *response, struct ast_json *json_headers,
+	struct ast_transfer_header_list **list_out);
 
 /*! \brief Return the corresponded hangup code of the given reason */
 static int convert_reason_to_hangup_code(const char* reason)
@@ -280,6 +286,7 @@ void ast_ari_channels_redirect(struct ast_variable *headers,
 {
 	RAII_VAR(struct stasis_app_control *, control, NULL, ao2_cleanup);
 	RAII_VAR(struct ast_channel_snapshot *, chan_snapshot, NULL, ao2_cleanup);
+	RAII_VAR(struct ast_transfer_header_list *, refer_headers, NULL, ao2_cleanup);
 	char *tech;
 	char *resource;
 	int tech_len;
@@ -327,7 +334,12 @@ void ast_ari_channels_redirect(struct ast_variable *headers,
 		return;
 	}
 
-	if (stasis_app_control_redirect(control, resource)) {
+	if (args->refer_headers
+		&& json_to_transfer_headers(response, args->refer_headers, &refer_headers)) {
+		return;
+	}
+
+	if (stasis_app_control_redirect(control, resource, refer_headers)) {
 		ast_ari_response_error(response, 500, "Internal Server Error",
 			"Failed to redirect channel");
 		return;
@@ -1409,6 +1421,159 @@ static int json_to_ast_variables(struct ast_ari_response *response, struct ast_j
 	}
 	ast_log(AST_LOG_ERROR, "Unable to convert 'variables' in JSON body to channel variables\n");
 
+	return -1;
+}
+
+static int transfer_header_is_token(const char *str)
+{
+	if (ast_strlen_zero(str)) {
+		return 0;
+	}
+
+	do {
+		if (!isalnum((unsigned char) *str)
+			&& !strchr("-.!%*_+`'~", *str)) {
+			return 0;
+		}
+	} while (*++str);
+
+	return 1;
+}
+
+static int transfer_header_name_blocked(const char *name)
+{
+	static const char *denylist[] = {
+		"Via",
+		"Route",
+		"Record-Route",
+		"Contact",
+		"From",
+		"To",
+		"Call-ID",
+		"CSeq",
+		"Max-Forwards",
+		"Content-Length",
+		"Content-Type",
+		"Authorization",
+		"Proxy-Authorization",
+		"Refer-To",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_LEN(denylist); ++i) {
+		if (!strcasecmp(name, denylist[i])) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int transfer_header_name_valid(const char *name)
+{
+	const char *p;
+
+	if (ast_strlen_zero(name)) {
+		return 0;
+	}
+
+	for (p = name; *p; ++p) {
+		if (*p == ':' || *p == '\r' || *p == '\n' || isspace((unsigned char) *p)) {
+			return 0;
+		}
+	}
+
+	return transfer_header_is_token(name);
+}
+
+static int transfer_header_value_valid(const char *value)
+{
+	if (!value) {
+		return 0;
+	}
+
+	return !strpbrk(value, "\r\n");
+}
+
+static int json_to_transfer_headers(struct ast_ari_response *response, struct ast_json *json_headers,
+	struct ast_transfer_header_list **list_out)
+{
+	size_t i;
+	struct ast_transfer_header_list *list;
+
+	if (!json_headers) {
+		return 0;
+	}
+
+	if (!ast_json_is_array(json_headers)) {
+		ast_ari_response_error(response, 400, "Bad Request",
+			"'refer_headers' must be an array of objects");
+		return -1;
+	}
+
+	list = ast_transfer_header_list_alloc();
+	if (!list) {
+		ast_ari_response_alloc_failed(response);
+		return -1;
+	}
+
+	for (i = 0; i < ast_json_array_size(json_headers); ++i) {
+		struct ast_json *entry = ast_json_array_get(json_headers, i);
+		struct ast_json *name_json;
+		struct ast_json *value_json;
+		const char *name;
+		const char *value;
+
+		if (!ast_json_is_object(entry)) {
+			ast_ari_response_error(response, 400, "Bad Request",
+				"'refer_headers' entries must be objects");
+			goto fail;
+		}
+
+		name_json = ast_json_object_get(entry, "name");
+		value_json = ast_json_object_get(entry, "value");
+		if (ast_json_typeof(name_json) != AST_JSON_STRING
+			|| ast_json_typeof(value_json) != AST_JSON_STRING) {
+			ast_ari_response_error(response, 400, "Bad Request",
+				"'refer_headers' entries require string 'name' and 'value'");
+			goto fail;
+		}
+
+		name = ast_json_string_get(name_json);
+		value = ast_json_string_get(value_json);
+
+		if (!transfer_header_name_valid(name)) {
+			ast_log(LOG_WARNING, "Rejecting invalid transfer header name '%s' from ARI\n", name);
+			ast_ari_response_error(response, 400, "Bad Request",
+				"Invalid refer_headers name");
+			goto fail;
+		}
+
+		if (transfer_header_name_blocked(name)) {
+			ast_log(LOG_WARNING, "Rejecting forbidden transfer header '%s' from ARI\n", name);
+			ast_ari_response_error(response, 400, "Bad Request",
+				"Forbidden refer_headers name");
+			goto fail;
+		}
+
+		if (!transfer_header_value_valid(value)) {
+			ast_log(LOG_WARNING, "Rejecting transfer header '%s' with invalid value from ARI\n", name);
+			ast_ari_response_error(response, 400, "Bad Request",
+				"Invalid refer_headers value");
+			goto fail;
+		}
+
+		if (ast_transfer_header_list_add(list, name, value)) {
+			ast_ari_response_alloc_failed(response);
+			goto fail;
+		}
+	}
+
+	*list_out = list;
+	return 0;
+
+fail:
+	ao2_cleanup(list);
 	return -1;
 }
 

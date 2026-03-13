@@ -897,6 +897,10 @@ int ast_ari_channels_redirect_parse_body(
 	if (field) {
 		args->endpoint = ast_json_string_get(field);
 	}
+	field = ast_json_object_get(body, "refer_headers");
+	if (field) {
+		args->refer_headers = field;
+	}
 	return 0;
 }
 

@@ -28,6 +28,7 @@
 #include "asterisk/stasis_channels.h"
 #include "asterisk/stasis_app.h"
 #include "asterisk/causes.h"
+#include "asterisk/channel.h"
 
 #include "command.h"
 #include "control.h"
@@ -504,16 +505,42 @@ int stasis_app_control_move(struct stasis_app_control *control, const char *app_
 	return 0;
 }
 
+struct redirect_data {
+	char *endpoint;
+	struct ast_transfer_header_list *refer_headers;
+};
+
+static void redirect_data_destroy(void *obj)
+{
+	struct redirect_data *redirect = obj;
+
+	if (!redirect) {
+		return;
+	}
+
+	ast_free(redirect->endpoint);
+	ao2_cleanup(redirect->refer_headers);
+	ast_free(redirect);
+}
+
 static int app_control_redirect(struct stasis_app_control *control,
 	struct ast_channel *chan, void *data)
 {
-	char *endpoint = data;
+	struct redirect_data *redirect = data;
 	int res;
 
 	ast_assert(control->channel != NULL);
-	ast_assert(endpoint != NULL);
+	ast_assert(redirect != NULL && redirect->endpoint != NULL);
 
-	res = ast_transfer(control->channel, endpoint);
+	if (redirect->refer_headers) {
+		ast_channel_transfer_header_list_set_temporary(control->channel, redirect->refer_headers);
+	}
+
+	res = ast_transfer(control->channel, redirect->endpoint);
+
+	if (redirect->refer_headers) {
+		ast_channel_transfer_header_list_set_temporary(control->channel, NULL);
+	}
 	if (!res) {
 		ast_log(LOG_NOTICE, "Unsupported transfer requested on channel '%s'\n",
 			ast_channel_name(control->channel));
@@ -523,15 +550,28 @@ static int app_control_redirect(struct stasis_app_control *control,
 	return 0;
 }
 
-int stasis_app_control_redirect(struct stasis_app_control *control, const char *endpoint)
+int stasis_app_control_redirect(struct stasis_app_control *control, const char *endpoint,
+	struct ast_transfer_header_list *refer_headers)
 {
-	char *endpoint_data = ast_strdup(endpoint);
+	struct redirect_data *redirect;
 
-	if (!endpoint_data) {
+	redirect = ast_calloc(1, sizeof(*redirect));
+	if (!redirect) {
 		return -1;
 	}
 
-	stasis_app_send_command_async(control, app_control_redirect, endpoint_data, ast_free_ptr);
+	redirect->endpoint = ast_strdup(endpoint);
+	if (!redirect->endpoint) {
+		redirect_data_destroy(redirect);
+		return -1;
+	}
+
+	if (refer_headers) {
+		ao2_ref(refer_headers, +1);
+		redirect->refer_headers = refer_headers;
+	}
+
+	stasis_app_send_command_async(control, app_control_redirect, redirect, redirect_data_destroy);
 
 	return 0;
 }
